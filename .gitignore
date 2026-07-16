@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Database (contains user data)
+*.db
+*.sqlite3
+
+# Checkpoints & models
+checkpoints/
+local_models/
+
+# Chroma DB
+chroma_db*/
+
+# Uploads
+uploads/
+
+# Logs & temp files
+pdf_progress.json
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+frontend/node_modules/
+frontend/dist/
+package-lock.json
+node_modules/

@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# Environment variables
+.env
+
+# Database & Data
+*.db
+*.sqlite3
+datasets/
+uploads/
+chroma_db_appliances/
+
+# Large model weights & checkpoints
+checkpoints/
+local_models/
+*.pth
+*.pkl
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
