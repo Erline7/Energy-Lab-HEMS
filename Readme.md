@@ -1,5 +1,7 @@
 # ⚡ Energy Lab — AI 驱动家庭能源管理系统
 
+> 当前运行方式、依赖兼容性与已知限制见 [RUNNING.md](RUNNING.md)。本仓库只保存代码，不包含数据库、说明书向量库、模型权重或 API 密钥。
+
 智能家庭能源管理系统 (HEMS)，融合实时能源监控、多智能体 AI 助手、以及基于深度学习的负荷预测与电器负荷分解功能，提供统一平台。
 
 ---
@@ -27,7 +29,7 @@
 | 机器学习/深度学习 | PyTorch, scikit-learn, XGBoost |
 | LLM/智能体 | LangChain, LangGraph, MCP (模型上下文协议) |
 | RAG | ChromaDB, sentence-transformers, BGE 重排器, BM25 |
-| PDF/OCR | PyMuPDF, OpenCV, magic-pdf, RapidOCR |
+| PDF/OCR | PyMuPDF, OpenCV, RapidOCR |
 | LLM 提供商 | 阿里 DashScope (Qwen), DeepSeek, Kimi |
 
 ---
@@ -38,7 +40,7 @@
 agent/
 ├── Backend/
 │   ├── app.py                  # FastAPI 服务 & LangGraph 多智能体编排
-│   ├── mcp_server.py           # MCP 工具服务器（15 个能源/AI 工具）
+│   ├── mcp_server.py           # MCP 工具服务器（16 个能源/AI 工具）
 │   ├── setup_database.py       # SQLAlchemy ORM 模型 & 数据库表结构
 │   ├── download_models.py      # 下载本地机器学习模型（Qwen via ModelScope）
 │   ├── requirements.txt        # Python 依赖清单

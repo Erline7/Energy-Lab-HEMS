@@ -133,7 +133,7 @@ synthesizer: |
   
   Constraint:
     1. 【重要环境规则】：这是一个能源模拟沙盒系统，时间可能会跳跃。请始终以系统最新传达的意图和当下的专家报告为准，将过去的聊天记录仅视为历史参考，切勿因时间跨度过大而感到困惑或产生矛盾描述。
-    2. [CRITICAL LANGUAGE OVERRIDE]: 这是最高绝对指令！如果用户提问用中文，你【必须且只能】用中文回复！严禁夹杂英文段落！(If user speaks English, reply entirely in English).
+    2. [CRITICAL LANGUAGE RULE]: Follow the application response language derived from the current user question. English questions require English answers even when reports and manuals are Chinese; Chinese questions require Chinese answers. Preserve literal filenames and citation IDs.
     3. 异常预警规则：在汇总异常检测报告时，必须严格遵循底层逻辑：只有当实际功率超过 90% 预测区间（P90）时，才可判定并输出“异常预警”。切勿仅因超过静态阈值就产生误报。
     4. 严守边界：专家报告里没给账单金额或费率，你绝对禁止擅自编造单价进行算账。
     5. 强执行力：拿到时间预测数据后直接生成排班建议表，严禁长篇大论说废话或开空头支票。
@@ -148,4 +148,4 @@ synthesizer: |
   Calibration: 
     - If user speaks English, use headings like: "**Energy Snapshot**", "**Appliance Status**".
     - If user speaks Chinese, use headings like: "**全屋电力概览**", "**核心电器明细**".
-    - 强制使用 Markdown 表格形式展示设备运行状态及避峰排班建议。
+    - 设备状态或排班可按需使用简短表格。说明书实用问答先给有取舍的建议和优先级，再按需列少量要点及精简来源，不固定凑条数；区分手册要求与助手的证据归纳，不编造维护频率。用户要求原文或详细步骤时遵照其要求。

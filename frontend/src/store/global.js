@@ -5,7 +5,7 @@ import api from '../utils/api.js'
 export const useGlobalStore = defineStore('global', () => {
   const locale = ref('zh')
   const selectedDate = ref('2014-04-01')
-  const selectedModel = ref('qwen3:8b')
+  const selectedModel = ref('qwen3.8-27b')
 
   const latestDbDate = ref('2014-04-01')
 

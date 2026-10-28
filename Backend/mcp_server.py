@@ -10,6 +10,8 @@ import pickle
 import threading
 import traceback
 import logging
+import time
+import inspect
 import torch
 import pandas as pd
 from rank_bm25 import BM25Okapi
@@ -29,7 +31,7 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-from functools import lru_cache
+from functools import lru_cache, wraps
 from langchain_chroma import Chroma
 from sqlalchemy import create_engine, text
 from langchain_core.tools import tool
@@ -76,6 +78,26 @@ MODELS: Dict[str, Any] = {
     'bm25_docs': None,           
     'reranker': None,          
 }
+
+
+def timed_tool(fn):
+    if inspect.iscoroutinefunction(fn):
+        @wraps(fn)
+        async def wrapped(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                logger.info("[工具耗时] %s %.2fs", fn.__name__, time.perf_counter() - started)
+    else:
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                logger.info("[工具耗时] %s %.2fs", fn.__name__, time.perf_counter() - started)
+    return wrapped
 
 mcp = FastMCP("EnergyLab")
 
@@ -194,6 +216,57 @@ def initialize_all_resources(mode="all"):
                 logger.warning(f"Reranker 加载失败（将跳过精排）: {e}")
                 MODELS['reranker'] = None
 
+_manual_retriever = None
+_manual_retriever_lock = threading.Lock()
+
+def get_manual_retriever():
+    """Load only retrieval resources, once per MCP process; never download models here."""
+    global _manual_retriever
+    from rag_service import ManualRetriever
+    if _manual_retriever is not None and _manual_retriever.store is MODELS['vectorstore']:
+        return _manual_retriever
+    with _manual_retriever_lock:
+        if _manual_retriever is not None and _manual_retriever.store is MODELS['vectorstore']:
+            return _manual_retriever
+        start = time.perf_counter()
+        if MODELS['vectorstore'] is None:
+            embedding_path = os.path.join(BASE_DIR, 'local_models/BAAI/bge-base-zh-v1.5')
+            persist_dir = os.path.join(BASE_DIR, 'chroma_db_appliances')
+            if not os.path.isfile(os.path.join(persist_dir, 'chroma.sqlite3')):
+                raise FileNotFoundError('已有说明书向量库不存在；不会自动创建空库')
+            if not os.path.isdir(embedding_path):
+                raise FileNotFoundError('本地 BGE 嵌入模型不存在；请先下载模型')
+            embed = HuggingFaceEmbeddings(
+                model_name=embedding_path,
+                model_kwargs={'device': DEVICE, 'local_files_only': True},
+                encode_kwargs={'normalize_embeddings': True},
+            )
+            MODELS['vectorstore'] = Chroma(persist_directory=persist_dir, embedding_function=embed)
+        else:
+            # Existing vectors were verified to have unit norm.
+            embed = getattr(MODELS['vectorstore'], '_embedding_function', None)
+            if hasattr(embed, 'encode_kwargs'):
+                embed.encode_kwargs = {**embed.encode_kwargs, 'normalize_embeddings': True}
+        logger.info('[RAG耗时] embedding_and_store_load %.3fs', time.perf_counter()-start)
+        use_reranker = os.getenv('RAG_USE_RERANKER', 'true').lower() in ('1','true','yes')
+        start = time.perf_counter()
+        reranker = MODELS['reranker'] if use_reranker else None
+        if use_reranker and reranker is None:
+            try:
+                path = os.path.join(BASE_DIR, 'local_models/BAAI/bge-reranker-base')
+                if not os.path.isdir(path):
+                    from huggingface_hub import snapshot_download
+                    path = snapshot_download('BAAI/bge-reranker-base', local_files_only=True)
+                reranker = FlagReranker(path, use_fp16=(DEVICE == 'cuda'))
+                MODELS['reranker'] = reranker
+            except Exception as exc:
+                logger.warning('本地/缓存重排模型不可用，采用向量与BM25融合，不自动下载: %s', exc)
+        logger.info('[RAG耗时] reranker_load %.3fs enabled=%s available=%s',
+                    time.perf_counter()-start, use_reranker, reranker is not None)
+        _manual_retriever = ManualRetriever(MODELS['vectorstore'], reranker=reranker)
+        return _manual_retriever
+
+
 def get_nilm_model(app_name):
     if app_name not in MODELS['nilm']:
         from NILM.nilm_train import TCN_BiGRU
@@ -239,6 +312,7 @@ def build_forecaster_features_20d(df_raw, max_power=6900.0):
     df = df.apply(pd.to_numeric, errors='coerce')
     df = df.resample('15min').mean().ffill().bfill()
 
+    df['hour_of_day'] = df.index.hour / 24.0
     df['sin_hour'] = np.sin(2 * np.pi * df.index.hour / 24.0)
     df['cos_hour'] = np.cos(2 * np.pi * df.index.hour / 24.0)
     df['sin_month'] = np.sin(2 * np.pi * (df.index.month - 1) / 12.0)
@@ -263,7 +337,7 @@ def build_forecaster_features_20d(df_raw, max_power=6900.0):
 
 
     base_cols = [
-        'sin_hour', 'cos_hour', 'sin_month', 'cos_month', 'is_weekend',
+        'cos_hour', 'hour_of_day', 'cos_month', 'is_weekend',
         'lag_1', 'lag_2', 'lag_3', 'lag_4',
         'diff_1',
         'roll_max_2', 'roll_max_4', 'roll_max_12',
@@ -452,6 +526,14 @@ def _run_forecaster_inference(target_datetime: str):
 
     max_p = MODELS['forecaster_meta'].get('max_power', 6900.0)
     x = build_forecaster_features_20d(df_h, max_power=max_p)
+
+    expected = MODELS['forecaster_meta']['in_channels']
+    if x.shape[-1] != expected:
+        logger.warning(
+            f"预测暂停：模型需要 {expected} 个特征，实际收到 {x.shape[-1]} 个"
+        )
+        return None, None, None
+
     with torch.no_grad():
         out = MODELS['forecaster'](x)[0].cpu().numpy()
 
@@ -461,6 +543,7 @@ def _run_forecaster_inference(target_datetime: str):
     return p10_series, p50_series, p90_series
 
 @mcp.tool()
+@timed_tool
 def realtime_nilm_monitor(user_app_name: str, target_datetime: str):
     """获取电器实时功率与额定参数。诊断运行效率。"""
     try:
@@ -516,11 +599,13 @@ def realtime_nilm_monitor(user_app_name: str, target_datetime: str):
         return f"诊断工具故障: {str(e)}"
 
 @mcp.tool()
+@timed_tool
 def get_current_weather_and_temperature(current_datetime: str):
     avg_temp = _get_daily_avg_temperature(current_datetime)
     return f"当前平均温度：{avg_temp}℃。"
 
 @mcp.tool()
+@timed_tool
 @lru_cache(maxsize=32)
 def query_historical_energy(start_date: str, end_date: str = None):
     """精确查询过去一段时间的全屋用电量及耗电明细。如果是查询某一天，start_date 和 end_date 请传入相同的日期（如 '2012-05-15'）。"""
@@ -644,6 +729,7 @@ def _background_learn_pdf(app_name: str, file_path: str):
         logger.error(f"后台任务崩溃详情如下：\n{traceback.format_exc()}")
 
 @mcp.tool()
+@timed_tool
 def add_pdf_manual(app_name: str, file_path: str):
     """读取本地的 PDF 说明书文件，进行 OCR 识别、翻译并录入到知识库中。参数 app_name: 家电名称（如“智能烤箱”）。参数 file_path: PDF 文件的完整路径。"""
     if not os.path.exists(file_path):
@@ -654,7 +740,65 @@ def add_pdf_manual(app_name: str, file_path: str):
 
     return f"指令已成功下达！我已经把【{app_name}】的说明书放到后台排队了。因为需要逐页进行视觉识别和翻译，大概需要几分钟时间。在此期间，您可以随时问我其他问题，互不影响！"
 
+
 @mcp.tool()
+@timed_tool
+def get_observed_energy_usage(current_datetime: str):
+    """只读查询指定日期截至指定时刻的实测累计用电(kWh)与最近记录的耗电设备；不运行预测或加载模型。输入完整日期时间；仅有日期时按该日末查询。设备功率来自已存储的NILM结果，并非实时电表或健康诊断。"""
+    try:
+        dt = pd.to_datetime(current_datetime)
+        if len(current_datetime.strip()) <= 10:
+            dt = dt.normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+        if pd.isna(dt) or dt.tzinfo is not None:
+            return json.dumps({"error": "请提供不含时区的有效本地日期时间"}, ensure_ascii=False)
+        params = {"start": str(dt.normalize()), "end": str(dt)}
+        df = pd.read_sql(text(
+            "SELECT timestamp, whe_power FROM telemetry_main "
+            "WHERE timestamp >= :start AND timestamp <= :end ORDER BY timestamp"
+        ), engine, params=params)
+        if df.empty:
+            return json.dumps({"selected_time": str(dt), "has_data": False,
+                               "message": "该日期截至所选时刻没有实测记录；不能据此判定为零用电"}, ensure_ascii=False)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['whe_power'] = pd.to_numeric(df['whe_power'], errors='coerce')
+        df = df.dropna().drop_duplicates('timestamp').sort_values('timestamp')
+        if df.empty:
+            return json.dumps({"error": "记录不包含有效功率或时间"}, ensure_ascii=False)
+        # This database stores one-minute samples. Do not fill long data gaps.
+        next_time = df['timestamp'].shift(-1).fillna(dt)
+        seconds = (next_time - df['timestamp']).dt.total_seconds().clip(lower=0, upper=60)
+        kwh = float((df['whe_power'] * seconds).sum() / 3600000.0)
+        apps = pd.read_sql(text(
+            "SELECT timestamp, app_code, inferred_power FROM nilm_inferred_logs "
+            "WHERE timestamp >= :start AND timestamp <= :end "
+            "ORDER BY timestamp DESC LIMIT 100"
+        ), engine, params=params)
+        latest = None
+        active = []
+        if not apps.empty:
+            latest = pd.to_datetime(apps['timestamp']).max()
+            apps = apps[pd.to_datetime(apps['timestamp']) == latest]
+            for row in apps.drop_duplicates('app_code').itertuples(index=False):
+                if pd.notna(row.inferred_power) and float(row.inferred_power) > 5:
+                    active.append({"code": row.app_code,
+                                   "name": REVERSE_APPLIANCE_MAP.get(row.app_code, row.app_code),
+                                   "power_w": round(float(row.inferred_power), 1)})
+        return json.dumps({
+            "selected_time": str(dt), "has_data": True,
+            "observed_kwh": round(kwh, 3), "sample_count": len(df),
+            "covered_hours": round(float(seconds.sum()) / 3600, 3),
+            "latest_power_record": str(df['timestamp'].max()),
+            "latest_appliance_record": str(latest) if latest is not None else None,
+            "appliance_record_age_minutes": round((dt-latest).total_seconds()/60, 1) if latest is not None else None,
+            "active_appliances": active,
+            "method": "按一分钟采样、分段恒定功率积分；每条记录最多覆盖60秒，不填补长时间缺测。设备列表仅反映最新存储NILM快照，5W为展示阈值；旧记录不能表述为现在正在运行。"
+        }, ensure_ascii=False)
+    except Exception as exc:
+        logger.exception("实测能源查询失败")
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+@mcp.tool()
+@timed_tool
 def predict_today_consumption(current_datetime: str):
     """获取全屋今日已用电量、剩余时间预测及历史同期日均值。对比数据，分析今日用电是否存在异常并给出诊断建议。"""
     try:
@@ -732,6 +876,7 @@ def predict_today_consumption(current_datetime: str):
         return f"能耗分析工具调用失败: {str(e)}"
 
 @mcp.tool()
+@timed_tool
 def predict_next_24_hours(current_datetime: str):
     """获取未来24小时的预测曲线特征。根据峰值时间建议用户避峰用电。"""
     try:
@@ -774,6 +919,7 @@ def predict_next_24_hours(current_datetime: str):
         return f"规划数据获取失败: {str(e)}"
 
 @mcp.tool()
+@timed_tool
 def predict_today_appliance_consumption(app_name: str, current_datetime: str):
     """获取特定电器的今日消耗、实时状态及历史均值。"""
     try:
@@ -859,6 +1005,7 @@ def predict_today_appliance_consumption(app_name: str, current_datetime: str):
 
 
 @mcp.tool()
+@timed_tool
 def predict_water_usage(current_datetime: str):
     """预测全屋实时用水速率、单日耗水预估及月度耗水预估。"""
     if MODELS['water_gas']['water'] is None:
@@ -936,6 +1083,7 @@ def predict_water_usage(current_datetime: str):
         return f"用水量预测失败: {str(e)}"
 
 @mcp.tool()
+@timed_tool
 def predict_gas_usage(current_datetime: str):
     """预测本月燃气总需求量。当用户询问燃气量、用气情况时调用。"""
     try:
@@ -965,6 +1113,7 @@ def predict_gas_usage(current_datetime: str):
         return f"燃气预测失败: {str(e)}"
 
 @mcp.tool()
+@timed_tool
 def predict_future_bills(resource_type: str, current_datetime: str, selected_date: str, days: int = 30, daily_energy_kwh: float = 0.0):
     """预估未来账单（包含电费、燃气费、水费）。"""
     year = pd.to_datetime(current_datetime).year
@@ -1098,73 +1247,21 @@ def predict_future_bills(resource_type: str, current_datetime: str, selected_dat
 
 
 @mcp.tool()
+@timed_tool
 def query_appliance_manual(app_name: str, problem_desc: str):
-    """查阅家电说明书。"""
+    """只读检索说明书，返回最多三个完整证据块及文件名、已存储页码。支持中英设备名和型号；app_name为空时从问题识别设备。重复请求缓存，绝不执行上传、删除、OCR或能源预测。"""
     try:
-        if MODELS['vectorstore'] is None:
-            initialize_all_resources(mode="tools")
-        
-        vectorstore = MODELS['vectorstore']
-        bm25 = MODELS['bm25_index']
-        bm25_docs = MODELS['bm25_docs']
-        reranker = MODELS['reranker']
-        search_filter = {"appliance_name": app_name} if app_name else None
-        
-        vector_results = vectorstore.similarity_search_with_score(
-            problem_desc, 
-            k=15,
-            filter=search_filter
-        )
-        candidates = [doc for doc, _ in vector_results]
-
-        if bm25 is not None and bm25_docs is not None:
-            tokenized_query = problem_desc.split()
-            bm25_scores = bm25.get_scores(tokenized_query)
-            top_indices = np.argsort(bm25_scores)[-10:][::-1]
-
-            existing_texts = {doc.page_content for doc in candidates}
-            for idx in top_indices:
-                text = bm25_docs[idx]
-                if text not in existing_texts:
-
-                    temp_doc = Document(page_content=text, metadata={"source": "bm25_recall"})
-                    candidates.append(temp_doc)
-                    existing_texts.add(text)
-        
-        if not candidates:
-            return f"未在说明书中找到相关内容。"
-        candidates = candidates[:10]
-        final_docs = candidates
-        if reranker is not None:
-            try:
-                pairs = [[problem_desc, doc.page_content] for doc in candidates]
-                scores = reranker.compute_score(pairs, normalize=True)
-                sorted_idx = np.argsort(scores)[::-1][:3]  # 取前 3 名
-                final_docs = [candidates[i] for i in sorted_idx]
-                logger.info(f"Rerank 完成，从 {len(candidates)} 个候选中精选出 {len(final_docs)} 个")
-            except Exception as e:
-                logger.warning(f"Rerank 执行失败，降级使用前 3 个候选: {e}")
-                final_docs = candidates[:3]
-        else:
-            final_docs = candidates[:3]
-
-        cleaned = []
-        for d in final_docs:
-            text = d.page_content.replace("#", "").replace("*", "").strip()
-            source = d.metadata.get('appliance_name', '未知设备')
-            cleaned.append(f"关于{source}的内容提示：{text[:300]}...")
-        
-        if not cleaned:
-            return "未找到相关知识点。"
-        
-        return "已找到相关知识点：\n" + "\n".join(cleaned)
-        
-    except Exception as e:
-        traceback.print_exc()
-        return f"检索失败: {str(e)}"
+        start = time.perf_counter()
+        retriever = get_manual_retriever()
+        logger.info('[RAG耗时] resources_ready %.3fs', time.perf_counter()-start)
+        return retriever.query(app_name, problem_desc)
+    except Exception as exc:
+        logger.exception('说明书检索失败')
+        return json.dumps({'status': 'error', 'error': str(exc), 'evidence': []}, ensure_ascii=False)
 
 
 @mcp.tool()
+@timed_tool
 def delete_appliance_knowledge(app_name: str):
     """从知识库中彻底删除特定电器的说明书内容。"""
     try:
@@ -1193,6 +1290,7 @@ def delete_appliance_knowledge(app_name: str):
         return f"清理过程发生异常: {str(e)}"
 
 @mcp.tool()
+@timed_tool
 def get_home_energy_snapshot(current_time: str):
     """一键获取全屋能耗全景快照。"""
     try:
@@ -1228,6 +1326,7 @@ def get_home_energy_snapshot(current_time: str):
         return f"快照获取失败: {str(e)}"
 
 @mcp.tool()
+@timed_tool
 async def global_inference_engine(target_datetime: str):
     """内部API专用：提供确定性的高频数据输出"""
     if MODELS['forecaster'] is None or MODELS['water_gas']['water'] is None:
@@ -1292,6 +1391,7 @@ async def global_inference_engine(target_datetime: str):
 
 
 @mcp.tool()
+@timed_tool
 async def get_dashboard_chart_data(selected_time: str):
     """内部API专用：为前端提供 96 维绘图数组、运行时间轴及KPI指标"""
     print(f"DEBUG: 接收到的时间是 {selected_time}")

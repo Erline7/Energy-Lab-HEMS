@@ -40,3 +40,8 @@ frontend/node_modules/
 frontend/dist/
 package-lock.json
 node_modules/
+
+# Local runtime and private configuration
+.venv/
+.env.*
+!.env.example

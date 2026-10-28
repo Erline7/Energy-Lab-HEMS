@@ -4,9 +4,9 @@
       <div class="control-group">
         <label>{{ store.isZh ? '智能体引擎 (LLM)' : 'LLM Engine' }}</label>
         <select v-model="store.selectedModel" class="styled-select">
-          <option value="qwen3.6-27b">Qwen3.6</option>
-          <option value="kimi-k2.6">Kimi (2.6)</option>
-          <option value="qwen3.7-max-2026-05-20">Qwen3.7 (Max)</option>
+          <option value="qwen3.8-27b">Qwen3.8</option>
+          <option value="deepseek-v4.1-flash">DeepSeek (4.1)</option>
+          <option value="kimi-k3">Kimi (3.0)</option>
         </select>
       </div>
 
@@ -120,9 +120,7 @@ const handleSend = async () => {
   if (!userInput.value.trim() || loading.value) return;
   const content = userInput.value;
   messages.value.push({ role: 'user', text: content });
-  const payloadContent = store.isZh
-    ? content
-    : content + '\n\n(System strict instruction: Please provide your entire response in English.)';
+  const payloadContent = content; // Response language follows the question, independently of UI language.
 
   userInput.value = '';
   loading.value = true;
@@ -134,7 +132,7 @@ const handleSend = async () => {
       selected_date: store.selectedDate || null, // 确保空值安全
       model: store.selectedModel,
       session_id: store.sessionId || "default"   // 🌟 补全 session_id 关联
-    });
+    }, { timeout: 180000 });
     messages.value.push({ role: 'ai', text: res.data.reply });
 
     const replyStr = res.data.reply || '';
@@ -146,7 +144,19 @@ const handleSend = async () => {
       startPollingProgress();
     }
   } catch (err) {
-    messages.value.push({ role: 'ai', text: store.isZh ? '请求失败，请检查后端。' : 'Error connecting to backend.' });
+    let errorText;
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      errorText = store.isZh
+        ? '等待回复超时，后台可能仍在处理。请查看后端日志，不要连续重复发送。'
+        : 'The reply timed out. The backend may still be processing. Check its logs before resending.';
+    } else if (err.response) {
+      const detail = err.response.data?.detail;
+      errorText = `${store.isZh ? '后端返回错误' : 'Backend error'} (${err.response.status})`;
+      if (typeof detail === 'string') errorText += `: ${detail}`;
+    } else {
+      errorText = store.isZh ? '无法连接后端，请确认后端服务已启动。' : 'Cannot reach the backend. Check that the server is running.';
+    }
+    messages.value.push({ role: 'ai', text: errorText });
   } finally {
     loading.value = false;
     await nextTick(() => chatBox.value.scrollTop = chatBox.value.scrollHeight);
